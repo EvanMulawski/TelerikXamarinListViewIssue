@@ -17,22 +17,34 @@ namespace TkXamListViewIssue.ViewModels
     public sealed class ItemsViewModel : IDisposable
     {
         private readonly CompositeDisposable _disposables;
+        private readonly ReadOnlyObservableCollection<Item> _selectedItems;
 
         public ItemsViewModel()
         {
             var itemsLoader = App.Current.DataSource.Items
                 .Connect()
                 .AutoRefresh()
+                .Sort(SortExpressionComparer<Item>.Ascending(x => x.DisplayOrder))
                 .Do(_ => System.Diagnostics.Debug.WriteLine("***DATA_SOURCE_CHANGE***"))
+                .Publish();
+
+            var allItemsLoader = itemsLoader
                 .ObserveOn(RxApp.MainThreadScheduler)
-                .Bind(Items)
+                .Bind(Items, new TestObservableCollectionAdapter()) // force reset when item changes ("refresh" change type)
+                //.Bind(Items) // the default implementation doesn't work
+                .Subscribe();
+
+            var selectedItemsLoader = itemsLoader
+                .Filter(x => x.IsSelected)
+                .Sort(SortExpressionComparer<Item>.Ascending(x => x.DisplayOrder.Value))
+                .Bind(out _selectedItems)
                 .Subscribe();
 
             BeginReorder = ReactiveCommand.Create<ReorderStartingCommandContext, Unit>(BeginReorderImpl);
             CommitReorder = ReactiveCommand.Create<ReorderEndedCommandContext, Unit>(CommitReorderImpl);
             ItemTapped = ReactiveCommand.Create<ItemTapCommandContext, Unit>(ItemTappedImpl);
 
-            _disposables = new CompositeDisposable(itemsLoader);
+            _disposables = new CompositeDisposable(itemsLoader.Connect(), allItemsLoader, selectedItemsLoader);
         }
 
         public ReactiveCommand<ReorderStartingCommandContext, Unit> BeginReorder { get; }
@@ -67,25 +79,59 @@ namespace TkXamListViewIssue.ViewModels
                 return Unit.Default;
             }
 
+            var selectedItems = _selectedItems.ToList();
             var item = (Item)context.Item;
+            var index = selectedItems.IndexOf(item);
             var destItem = (Item)context.DestinationItem;
-            var destIndex = Items.IndexOf(destItem);
+            var destIndex = selectedItems.IndexOf(destItem);
 
-            if (context.Placement == ItemReorderPlacement.After)
+            using (Items.SuspendNotifications())
             {
-                destIndex++;
+                item.DisplayOrder = destIndex;
+
+                if (index > destIndex)
+                {
+                    // item was moved up
+                    for (var i = destIndex; i < index; i++)
+                    {
+                        var itemToAdjust = selectedItems[i];
+                        itemToAdjust.DisplayOrder = i + 1;
+                    }
+                }
+                else if (index < destIndex)
+                {
+                    // item was moved down
+                    for (var i = index + 1; i <= destIndex; i++)
+                    {
+                        var itemToAdjust = selectedItems[i];
+                        itemToAdjust.DisplayOrder = i - 1;
+                    }
+                } 
             }
-
-            item.DisplayOrder = destIndex;
-
+            
             System.Diagnostics.Debug.WriteLine($"ITEM_REORDERED: Id={item.Id},IsSelected={item.IsSelected},DisplayOrder={item.DisplayOrder}");
 
-            foreach (var otherItem in Items.Where(x => x.IsSelected && x.DisplayOrder.Value >= destIndex && x != item))
-            {
-                otherItem.DisplayOrder = otherItem.DisplayOrder.Value + 1;
-            }
+            LogAllItems();
 
             return Unit.Default;
+        }
+
+        private void UnselectItem(int index, Item unselectedItem)
+        {
+            var selectedItems = _selectedItems.ToList();
+            selectedItems.Remove(unselectedItem);
+
+            using (Items.SuspendNotifications())
+            {
+                unselectedItem.DisplayOrder = null;
+                unselectedItem.IsSelected = false;
+
+                for (var i = index; i < selectedItems.Count; i++)
+                {
+                    var itemToAdjust = selectedItems[i];
+                    itemToAdjust.DisplayOrder = i;
+                }
+            }
         }
 
         private static readonly SortDescriptorBase SortDescriptor = new DelegateSortDescriptor
@@ -123,25 +169,68 @@ namespace TkXamListViewIssue.ViewModels
         private Unit ItemTappedImpl(ItemTapCommandContext context)
         {
             var item = (Item)context.Item;
+            var index = Items.IndexOf(item);
 
             using (item.DelayChangeNotifications())
             {
-                item.DisplayOrder = item.IsSelected ? (int?)null : Items.Count(x => x.IsSelected);
-                item.IsSelected = !item.IsSelected;
-
-                // this results in an invalid state
-                //Items.Remove(item);
-                //Items.Add(item);
+                if (item.IsSelected)
+                {
+                    UnselectItem(index, item);
+                }
+                else
+                {
+                    SelectItem(item);
+                }
 
                 System.Diagnostics.Debug.WriteLine($"ITEM_TAPPED: Id={item.Id},IsSelected={item.IsSelected},DisplayOrder={item.DisplayOrder}");
             }
 
+            LogAllItems();
+
             return Unit.Default;
+        }
+
+        private void SelectItem(Item item)
+        {
+            // order matters here
+            item.DisplayOrder = Items.Count(x => x.IsSelected);
+            item.IsSelected = true;
+        }
+
+        private void LogAllItems()
+        {
+            System.Diagnostics.Debug.WriteLine($"----------");
+            foreach (var item in Items)
+            {
+                System.Diagnostics.Debug.WriteLine($"Id={item.Id},IsSelected={item.IsSelected},DisplayOrder={item.DisplayOrder}");
+            }
+            System.Diagnostics.Debug.WriteLine($"----------");
         }
 
         public void Dispose()
         {
             _disposables?.Dispose();
+        }
+    }
+
+    internal class TestObservableCollectionAdapter : IObservableCollectionAdaptor<Item, int>
+    {
+        private readonly IObservableCollectionAdaptor<Item, int> _defaultAdapter = new ObservableCollectionAdaptor<Item, int>();
+
+        public void Adapt(IChangeSet<Item, int> changes, IObservableCollection<Item> collection)
+        {
+            using (collection.SuspendNotifications())
+            {
+                //foreach (var change in changes)
+                //{
+                //    if (change.Reason == ChangeReason.Refresh)
+                //    {
+                //        collection.Replace(change.Current, change.Current);
+                //    }
+                //}
+                
+                _defaultAdapter.Adapt(changes, collection);
+            }
         }
     }
 }
